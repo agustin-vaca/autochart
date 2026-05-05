@@ -16,6 +16,9 @@ output/
 *.wav
 *.flac
 
+# Chart reference files
+*.sng
+
 # OS files
 .DS_Store
 Thumbs.db
