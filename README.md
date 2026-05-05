@@ -48,6 +48,8 @@ Optional:
   --art ART           Path to album art image
   --output DIR        Output directory (default: current dir)
   --no-preview        Skip opening preview in browser
+  --no-separation     Skip Demucs source separation
+  --separation-model  Demucs model (default: htdemucs)
 ```
 
 ## How It Works
@@ -83,7 +85,7 @@ cli.py             # Command-line interface
 
 ## Roadmap
 
-- [ ] Guitar source separation (Demucs) for better note detection
+- [x] Guitar source separation (Demucs) for better note detection
 - [ ] Real audio-to-MIDI (Basic Pitch) instead of onset-based mapping
 - [ ] Desktop app (Tauri)
 - [ ] Optional cloud AI refinement (bring your own API key)

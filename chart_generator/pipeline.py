@@ -1,12 +1,14 @@
 """End-to-end pipeline: audio file → Clone Hero chart folder."""
 from __future__ import annotations
+import logging
 import os
 import shutil
+import tempfile
 import wave
 import struct
 import numpy as np
 
-from chart_generator.audio import analyze_audio_array
+from chart_generator.audio import analyze_audio_array, detect_bpm, detect_onsets
 from chart_generator.mapper import MidiNote, map_notes_to_frets
 from chart_generator.chart import (
     ChartSong,
@@ -18,6 +20,9 @@ from chart_generator.chart import (
 from chart_generator.difficulty import derive_difficulty
 from chart_generator.output import SongMetadata, generate_song_ini, assemble_output_folder
 from chart_generator.preview import generate_preview_html
+from chart_generator.separator import separate_guitar
+
+logger = logging.getLogger(__name__)
 
 
 def _load_audio(path: str) -> tuple[np.ndarray, int]:
@@ -109,22 +114,62 @@ def generate_chart_from_audio(
     metadata: SongMetadata,
     output_dir: str,
     album_art_path: str | None = None,
+    use_separation: bool = True,
+    separation_model: str | None = None,
 ) -> str:
     """Full pipeline: audio file → Clone Hero chart folder.
 
+    Args:
+        audio_path: Path to the input audio file.
+        metadata: Song metadata for chart generation.
+        output_dir: Directory for the output chart folder.
+        album_art_path: Optional path to album art image.
+        use_separation: If True, attempt Demucs source separation for
+            better guitar note detection. Falls back gracefully.
+        separation_model: Demucs model name (default: 'htdemucs').
+            Use 'htdemucs_6src' for explicit guitar stem.
+
     Returns the path to the generated output folder.
     """
-    # Load audio (WAV via stdlib, MP3/OGG via pydub fallback)
+    # Load full mix audio (WAV via stdlib, MP3/OGG via ffmpeg fallback)
     audio, sr = _load_audio(audio_path)
+    duration_sec = len(audio) / sr
 
-    # Analyze audio
-    analysis = analyze_audio_array(audio, sr)
+    # BPM detection always uses the full mix (drums help)
+    bpm, bpm_confidence = detect_bpm(audio, sr)
+
+    # Attempt source separation for better onset detection
+    guitar_audio = None
+    guitar_sr = sr
+    work_dir = None
+
+    if use_separation:
+        try:
+            work_dir = tempfile.mkdtemp(prefix="autochart_stems_")
+            guitar_path = separate_guitar(audio_path, work_dir, separation_model)
+            if guitar_path is not None:
+                guitar_audio, guitar_sr = _load_audio(guitar_path)
+                logger.info("Using separated guitar stem for onset detection.")
+        except Exception as e:
+            logger.warning("Source separation error: %s. Using full mix.", e)
+
+    # Onset detection: use guitar stem if available, otherwise full mix
+    onset_source = guitar_audio if guitar_audio is not None else audio
+    onset_sr = guitar_sr if guitar_audio is not None else sr
+    onset_times = detect_onsets(onset_source, onset_sr)
+
+    # Clean up temp separation files
+    if work_dir is not None:
+        try:
+            shutil.rmtree(work_dir)
+        except OSError:
+            pass
 
     # Convert onsets to MIDI-like notes
-    midi_notes = _onsets_to_midi_notes(analysis.onset_times, analysis.duration_sec)
+    midi_notes = _onsets_to_midi_notes(onset_times, duration_sec)
 
     # Map to 5-fret notes
-    fret_notes = map_notes_to_frets(midi_notes, bpm=analysis.bpm, resolution=192)
+    fret_notes = map_notes_to_frets(midi_notes, bpm=bpm, resolution=192)
 
     # Build chart structures
     song = ChartSong(
@@ -135,7 +180,7 @@ def generate_chart_from_audio(
 
     sync = SyncTrack()
     sync.add_time_signature(0, 4)
-    sync.add_bpm(0, analysis.bpm)
+    sync.add_bpm(0, bpm)
 
     # Build Expert track
     expert = ChartTrack("ExpertSingle")
@@ -151,16 +196,16 @@ def generate_chart_from_audio(
 
     # Build events (minimal sections)
     events: list[SectionEvent] = []
-    if analysis.duration_sec > 5:
+    if duration_sec > 5:
         events.append(SectionEvent(tick=0, name="Intro"))
-        mid_tick = int(analysis.duration_sec / 2 * analysis.bpm / 60 * 192)
+        mid_tick = int(duration_sec / 2 * bpm / 60 * 192)
         events.append(SectionEvent(tick=mid_tick, name="Middle"))
 
     # Generate chart string
     chart_content = build_chart_string(song, sync, events, tracks)
 
     # Generate song.ini
-    song_length_ms = int(analysis.duration_sec * 1000)
+    song_length_ms = int(duration_sec * 1000)
     ini_content = generate_song_ini(metadata, song_length_ms)
 
     # Assemble output folder

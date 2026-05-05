@@ -32,6 +32,9 @@ Examples:
     parser.add_argument("--art", default=None, help="Path to album art image")
     parser.add_argument("--output", default=".", help="Output directory (default: current dir)")
     parser.add_argument("--no-preview", action="store_true", help="Skip opening preview in browser")
+    parser.add_argument("--no-separation", action="store_true", help="Skip Demucs source separation")
+    parser.add_argument("--separation-model", default=None,
+                        help="Demucs model (default: htdemucs). Use htdemucs_6src for explicit guitar stem")
 
     args = parser.parse_args()
 
@@ -68,6 +71,8 @@ Examples:
         metadata=meta,
         output_dir=output_dir,
         album_art_path=args.art,
+        use_separation=not args.no_separation,
+        separation_model=args.separation_model,
     )
 
     elapsed = time.time() - start
