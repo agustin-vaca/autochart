@@ -9,6 +9,12 @@ dist/
 build/
 *.egg-info/
 
+# Audio test files
+*.mp3
+*.ogg
+*.wav
+*.flac
+
 # OS files
 .DS_Store
 Thumbs.db
