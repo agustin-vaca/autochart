@@ -8,7 +8,7 @@ import wave
 import struct
 import numpy as np
 
-from chart_generator.audio import analyze_audio_array, detect_bpm, detect_onsets
+from chart_generator.audio import detect_bpm, detect_onsets
 from chart_generator.mapper import MidiNote, map_notes_to_frets
 from chart_generator.chart import (
     ChartSong,
@@ -21,6 +21,13 @@ from chart_generator.difficulty import derive_difficulty
 from chart_generator.output import SongMetadata, generate_song_ini, assemble_output_folder
 from chart_generator.preview import generate_preview_html
 from chart_generator.separator import separate_guitar
+from chart_generator.transcription import (
+    detect_beats,
+    transcribe_notes,
+    is_basic_pitch_available,
+    TranscribedNote,
+    BeatMap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +116,50 @@ def _onsets_to_midi_notes(onset_times: list[float], duration_sec: float) -> list
     return notes
 
 
+def _time_to_tick_with_tempo_map(
+    time_sec: float,
+    tempo_changes: list[tuple[float, float]],
+    resolution: int = 192,
+) -> int:
+    """Convert time in seconds to tick using a variable tempo map.
+
+    Args:
+        time_sec: Time position in seconds.
+        tempo_changes: List of (time_sec, bpm) pairs, sorted by time.
+        resolution: Ticks per beat.
+    """
+    tick = 0.0
+    prev_time = 0.0
+    prev_bpm = tempo_changes[0][1] if tempo_changes else 120.0
+
+    for change_time, change_bpm in tempo_changes:
+        if change_time >= time_sec:
+            break
+        # Accumulate ticks from prev_time to change_time at prev_bpm
+        dt = change_time - prev_time
+        tick += dt * (prev_bpm / 60.0) * resolution
+        prev_time = change_time
+        prev_bpm = change_bpm
+
+    # Accumulate remaining time
+    dt = time_sec - prev_time
+    tick += dt * (prev_bpm / 60.0) * resolution
+    return int(round(tick))
+
+
+def _transcribed_to_midi_notes(notes: list[TranscribedNote]) -> list[MidiNote]:
+    """Convert Basic Pitch transcribed notes to MidiNote format."""
+    return [
+        MidiNote(
+            start_time=n.start_time,
+            end_time=n.end_time,
+            pitch=n.pitch,
+            confidence=n.amplitude,
+        )
+        for n in notes
+    ]
+
+
 def generate_chart_from_audio(
     audio_path: str,
     metadata: SongMetadata,
@@ -119,26 +170,33 @@ def generate_chart_from_audio(
 ) -> str:
     """Full pipeline: audio file → Clone Hero chart folder.
 
+    Uses the best available transcription method:
+    1. Demucs separation + Basic Pitch (if available) — real MIDI transcription
+    2. Demucs separation + onset detection (fallback)
+
+    Beat tracking provides a variable tempo map for better timing accuracy.
+
     Args:
         audio_path: Path to the input audio file.
         metadata: Song metadata for chart generation.
         output_dir: Directory for the output chart folder.
         album_art_path: Optional path to album art image.
-        use_separation: If True, attempt Demucs source separation for
-            better guitar note detection. Falls back gracefully.
+        use_separation: If True, attempt Demucs source separation.
         separation_model: Demucs model name (default: 'htdemucs').
-            Use 'htdemucs_6src' for explicit guitar stem.
 
     Returns the path to the generated output folder.
     """
-    # Load full mix audio (WAV via stdlib, MP3/OGG via ffmpeg fallback)
+    # Load full mix audio
     audio, sr = _load_audio(audio_path)
     duration_sec = len(audio) / sr
 
-    # BPM detection always uses the full mix (drums help)
-    bpm, bpm_confidence = detect_bpm(audio, sr)
+    # Beat tracking for variable BPM (uses full mix — drums help)
+    beat_map = detect_beats(audio, sr)
+    logger.info("Beat tracking: median BPM=%.1f, %d tempo changes",
+                beat_map.median_bpm, len(beat_map.tempo_changes))
 
-    # Attempt source separation for better onset detection
+    # Source separation
+    transcription_path = None
     guitar_audio = None
     guitar_sr = sr
     work_dir = None
@@ -146,17 +204,35 @@ def generate_chart_from_audio(
     if use_separation:
         try:
             work_dir = tempfile.mkdtemp(prefix="autochart_stems_")
-            guitar_path = separate_guitar(audio_path, work_dir, separation_model)
-            if guitar_path is not None:
-                guitar_audio, guitar_sr = _load_audio(guitar_path)
-                logger.info("Using separated guitar stem for onset detection.")
+            guitar_stem_path = separate_guitar(audio_path, work_dir, separation_model)
+            if guitar_stem_path is not None:
+                transcription_path = guitar_stem_path
+                guitar_audio, guitar_sr = _load_audio(guitar_stem_path)
+                logger.info("Using separated guitar stem for transcription.")
         except Exception as e:
             logger.warning("Source separation error: %s. Using full mix.", e)
 
-    # Onset detection: use guitar stem if available, otherwise full mix
-    onset_source = guitar_audio if guitar_audio is not None else audio
-    onset_sr = guitar_sr if guitar_audio is not None else sr
-    onset_times = detect_onsets(onset_source, onset_sr)
+    # Note detection: prefer Basic Pitch, fall back to onset detection
+    use_basic_pitch = is_basic_pitch_available()
+
+    if use_basic_pitch:
+        # Basic Pitch transcription on separated stem (or full mix)
+        bp_path = transcription_path or audio_path
+        try:
+            transcribed = transcribe_notes(bp_path, min_confidence=0.4)
+            midi_notes = _transcribed_to_midi_notes(transcribed)
+            logger.info("Basic Pitch: %d notes detected.", len(midi_notes))
+        except Exception as e:
+            logger.warning("Basic Pitch failed: %s. Falling back to onset detection.", e)
+            use_basic_pitch = False
+
+    if not use_basic_pitch:
+        # Fallback: onset detection
+        onset_source = guitar_audio if guitar_audio is not None else audio
+        onset_sr = guitar_sr if guitar_audio is not None else sr
+        onset_times = detect_onsets(onset_source, onset_sr)
+        midi_notes = _onsets_to_midi_notes(onset_times, duration_sec)
+        logger.info("Onset detection: %d notes.", len(midi_notes))
 
     # Clean up temp separation files
     if work_dir is not None:
@@ -165,11 +241,18 @@ def generate_chart_from_audio(
         except OSError:
             pass
 
-    # Convert onsets to MIDI-like notes
-    midi_notes = _onsets_to_midi_notes(onset_times, duration_sec)
+    # Build tempo map for the SyncTrack
+    resolution = 192
+    sync = SyncTrack()
+    sync.add_time_signature(0, 4)
 
-    # Map to 5-fret notes
-    fret_notes = map_notes_to_frets(midi_notes, bpm=bpm, resolution=192)
+    # Add all tempo changes from beat tracking
+    for change_time, change_bpm in beat_map.tempo_changes:
+        tick = _time_to_tick_with_tempo_map(change_time, beat_map.tempo_changes, resolution)
+        sync.add_bpm(tick, change_bpm)
+
+    # Map notes to frets using variable tempo map
+    fret_notes = _map_notes_with_tempo(midi_notes, beat_map.tempo_changes, resolution)
 
     # Build chart structures
     song = ChartSong(
@@ -177,10 +260,6 @@ def generate_chart_from_audio(
         artist=metadata.artist,
         genre=metadata.genre,
     )
-
-    sync = SyncTrack()
-    sync.add_time_signature(0, 4)
-    sync.add_bpm(0, bpm)
 
     # Build Expert track
     expert = ChartTrack("ExpertSingle")
@@ -198,7 +277,8 @@ def generate_chart_from_audio(
     events: list[SectionEvent] = []
     if duration_sec > 5:
         events.append(SectionEvent(tick=0, name="Intro"))
-        mid_tick = int(duration_sec / 2 * bpm / 60 * 192)
+        mid_tick = _time_to_tick_with_tempo_map(
+            duration_sec / 2, beat_map.tempo_changes, resolution)
         events.append(SectionEvent(tick=mid_tick, name="Middle"))
 
     # Generate chart string
@@ -227,3 +307,57 @@ def generate_chart_from_audio(
     )
 
     return result_path
+
+
+def _map_notes_with_tempo(
+    notes: list[MidiNote],
+    tempo_changes: list[tuple[float, float]],
+    resolution: int = 192,
+) -> list:
+    """Map MIDI notes to fret notes using a variable tempo map.
+
+    This uses the tempo map for time→tick conversion instead of a fixed BPM,
+    then applies the standard fret mapping heuristics.
+    """
+    from chart_generator.mapper import FretNote, quantize_to_grid
+
+    if not notes:
+        return []
+
+    # Collect unique pitches for fret mapping
+    pitches = sorted(set(n.pitch for n in notes))
+    if len(pitches) == 1:
+        pitch_to_base = {pitches[0]: 2}
+    else:
+        pitch_to_base = {}
+        for i, p in enumerate(pitches):
+            pitch_to_base[p] = int(round(i * 4 / (len(pitches) - 1)))
+
+    result = []
+    prev_fret = None
+
+    for note in sorted(notes, key=lambda n: n.start_time):
+        target_fret = pitch_to_base[note.pitch]
+
+        # Limit jumps from previous note
+        if prev_fret is not None:
+            diff = target_fret - prev_fret
+            if diff > 2:
+                target_fret = prev_fret + 2
+            elif diff < -2:
+                target_fret = prev_fret - 2
+
+        target_fret = max(0, min(4, target_fret))
+
+        tick = _time_to_tick_with_tempo_map(note.start_time, tempo_changes, resolution)
+        tick = max(0, tick)
+        tick = quantize_to_grid(tick, resolution)
+
+        dur_tick = _time_to_tick_with_tempo_map(
+            note.start_time + note.duration, tempo_changes, resolution) - tick
+        dur_tick = max(0, dur_tick)
+
+        result.append(FretNote(tick=tick, fret=target_fret, duration_ticks=dur_tick))
+        prev_fret = target_fret
+
+    return result

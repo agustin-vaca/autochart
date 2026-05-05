@@ -15,6 +15,7 @@ output/
 *.ogg
 *.wav
 *.flac
+*.zip
 
 # Chart reference files
 *.sng
@@ -27,3 +28,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Temp research/comparison artifacts
+_audio2chart/
+compare_charts.py
+gen_basic_pitch.py

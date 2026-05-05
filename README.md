@@ -54,33 +54,40 @@ Optional:
 
 ## How It Works
 
-1. **BPM Detection** — autocorrelation-based tempo estimation with octave correction
-2. **Onset Detection** — spectral flux analysis to find note attack points
-3. **Fret Mapping** — gameplay heuristics: pitch contour preservation, hand-position consistency, jump limiting
-4. **Difficulty Derivation** — rhythmic backbone reduction (Expert → Hard → Medium → Easy)
-5. **Chart Generation** — outputs valid `.chart` format readable by Clone Hero
+1. **Source Separation** — Demucs isolates the guitar/instrument stem from the mix
+2. **Beat Tracking** — librosa beat detection builds a variable tempo map for accurate timing
+3. **Note Transcription** — Basic Pitch (Spotify) performs polyphonic audio-to-MIDI transcription on the isolated stem
+4. **Fret Mapping** — gameplay heuristics: pitch contour preservation, hand-position consistency, jump limiting
+5. **Difficulty Derivation** — rhythmic backbone reduction (Expert → Hard → Medium → Easy)
+6. **Chart Generation** — outputs valid `.chart` format readable by Clone Hero
+
+Falls back gracefully if Demucs or Basic Pitch aren't installed (uses onset detection).
 
 ## Dependencies
 
 All free and open-source:
 - Python 3.10+
-- NumPy (BSD)
-- SciPy (BSD)
+- NumPy, SciPy (BSD)
+- librosa (ISC) — beat tracking
+- Basic Pitch (Apache 2.0) — polyphonic audio-to-MIDI transcription
+- Demucs + PyTorch (MIT) — source separation
 - FFmpeg (LGPL) — for MP3/OGG input
 
 ## Project Structure
 
 ```
 chart_generator/
-├── audio.py       # BPM & onset detection (scipy/numpy)
-├── mapper.py      # MIDI→5-fret mapping with gameplay heuristics
-├── chart.py       # .chart file data structures, generation & parsing
-├── difficulty.py  # Derive Easy/Medium/Hard from Expert
-├── output.py      # song.ini generation & folder assembly
-├── preview.py     # HTML preview with note highway & audio playback
-└── pipeline.py    # End-to-end: audio → Clone Hero folder
-tests/             # 74 tests covering all modules
-cli.py             # Command-line interface
+├── audio.py         # BPM & onset detection (scipy/numpy) — fallback
+├── transcription.py # Beat tracking (librosa) & Basic Pitch transcription
+├── separator.py     # Demucs source separation
+├── mapper.py        # MIDI→5-fret mapping with gameplay heuristics
+├── chart.py         # .chart file data structures, generation & parsing
+├── difficulty.py    # Derive Easy/Medium/Hard from Expert
+├── output.py        # song.ini generation & folder assembly
+├── preview.py       # HTML preview with note highway & audio playback
+└── pipeline.py      # End-to-end: audio → Clone Hero folder
+tests/               # 83+ tests covering all modules
+cli.py               # Command-line interface
 ```
 
 ## Roadmap
